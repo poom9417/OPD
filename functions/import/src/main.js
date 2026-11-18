@@ -1,64 +1,69 @@
-// Trigger: users.*.create
-//  - อีเมลที่ไม่ใช่ @mahidol.ac.th → ลบบัญชีทันที
-//  - อีเมลอยู่ใน BOOTSTRAP_ROLES (env ของ Function, อีเมลยืนยันแล้ว) → ติด label + app_users = approved
-//  - นอกนั้น → app_users = pending (ยังไม่มี label จึงมองไม่เห็นข้อมูล รอ admin อนุมัติ)
-// แถว app_users ให้เจ้าของอ่านสถานะตัวเองได้ (หน้า "รออนุมัติ" / "ถูกปฏิเสธ")
-import { Client, TablesDB, Users, Permission, Role } from 'node-appwrite';
+import { Client, TablesDB, Users, Query, ID } from 'node-appwrite';
+import { planDaily, applyPlan, chunk } from './core.js';
 
-const DOMAIN = '@mahidol.ac.th';
-const ROLES = ['developer', 'admin', 'user', 'viewer'];
+const DB = 'opd';
+const ALLOWED = ['developer', 'admin'];
 
-// BOOTSTRAP_ROLES = {"someone@mahidol.ac.th":"admin", ...}  (ตั้งเป็น variable ใน Appwrite ไม่เก็บใน repo)
-function loadBootstrap(log) {
-  const map = new Map();
-  try {
-    const raw = JSON.parse(process.env.BOOTSTRAP_ROLES || '{}');
-    for (const [email, role] of Object.entries(raw)) {
-      const e = String(email).trim().toLowerCase();
-      if (e.endsWith(DOMAIN) && ROLES.includes(role)) map.set(e, role);
-      else log(`ignored bootstrap entry (bad domain/role): ${role}`);
-    }
-  } catch (e) {
-    log(`BOOTSTRAP_ROLES unreadable: ${e.message}`);
-  }
-  return map;
-}
-
-export default async ({ req, res, log, error }) => {
+export default async ({ req, res, error }) => {
   const client = new Client()
     .setEndpoint(process.env.APPWRITE_FUNCTION_API_ENDPOINT)
     .setProject(process.env.APPWRITE_FUNCTION_PROJECT_ID)
     .setKey(req.headers['x-appwrite-key']);
-  const user = typeof req.body === 'string' ? JSON.parse(req.body || '{}') : req.body || {};
-  if (!user.$id) return res.json({ ok: false, error: 'no user in event' }, 400);
+  const users = new Users(client);
+  const tables = new TablesDB(client);
 
-  const email = String(user.email || '').trim().toLowerCase();
+  // --- ตรวจผู้เรียก: ต้องล็อกอิน, โดเมน mahidol, มี role ที่อนุญาต ---
+  const uid = req.headers['x-appwrite-user-id'];
+  if (!uid) return res.json({ ok: false, error: 'unauthenticated' }, 401);
+  const u = await users.get({ userId: uid });
+  if (!/@mahidol\.ac\.th$/i.test(u.email || '') || !u.labels.some((l) => ALLOWED.includes(l)))
+    return res.json({ ok: false, error: 'forbidden' }, 403);
+
+  const body = typeof req.body === 'string' ? JSON.parse(req.body || '{}') : req.body || {};
+
+  const db = {
+    async getByIds(table, ids) {
+      const m = new Map();
+      for (const part of chunk([...new Set(ids)], 100)) {
+        if (!part.length) continue;
+        const r = await tables.listRows({ databaseId: DB, tableId: table, queries: [Query.equal('$id', part), Query.limit(100)], total: false });
+        for (const row of r.rows) m.set(row.$id, row);
+      }
+      return m;
+    },
+    async upsert(table, rows) {
+      for (const part of chunk(rows, 100))
+        if (part.length) await tables.upsertRows({ databaseId: DB, tableId: table, rows: part });
+    },
+  };
+
   try {
-    const users = new Users(client);
-    if (!email.endsWith(DOMAIN)) {
-      await users.delete({ userId: user.$id });
-      log(`deleted non-mahidol user ${user.$id}`);
-      return res.json({ ok: true, deleted: true });
+    switch (body.action) {
+      case 'open_batch': {
+        const id = ID.unique();
+        await tables.createRow({ databaseId: DB, tableId: 'import_batches', rowId: id, data: {
+          kind: 'daily', filename: body.filename || null, file_date: body.fileDate || null, uploaded_by: uid, status: 'running' } });
+        return res.json({ ok: true, batchId: id });
+      }
+      case 'preview_daily': {
+        const plan = await planDaily(body.rows || [], db, { fileDate: body.fileDate, decisions: body.decisions || {} });
+        return res.json({ ok: true, summary: plan.summary, needsDecision: plan.needsDecision, errors: plan.errors });
+      }
+      case 'commit_daily': {
+        const plan = await planDaily(body.rows || [], db, { fileDate: body.fileDate, decisions: body.decisions || {} });
+        const summary = await applyPlan(plan, db, { batchId: body.batchId, userId: uid });
+        return res.json({ ok: true, summary, needsDecision: plan.needsDecision });
+      }
+      case 'close_batch': {
+        const t = body.totals || {};
+        await tables.updateRow({ databaseId: DB, tableId: 'import_batches', rowId: body.batchId, data: {
+          status: 'done', rows_total: t.rows_total || 0, rows_new: t.new_lines || 0, rows_updated: t.updated_cases || 0,
+          rows_skipped: (t.dup_lines || 0) + (t.skipped_cases || 0), rows_review: t.needs_decision || 0 } });
+        return res.json({ ok: true });
+      }
+      default:
+        return res.json({ ok: false, error: 'unknown action' }, 400);
     }
-
-    // สิทธิ์ที่กำหนดล่วงหน้า ให้เฉพาะอีเมลที่ผู้ให้บริการ OAuth ยืนยันแล้วเท่านั้น
-    let role = loadBootstrap(log).get(email);
-    if (role && user.emailVerification !== true) {
-      log(`bootstrap role skipped, email not verified: ${user.$id}`);
-      role = undefined;
-    }
-
-    const row = { $id: user.$id, email, role: role || 'viewer', approval_status: 'pending',
-      $permissions: [Permission.read(Role.user(user.$id))] };
-    if (role) {
-      await users.updateLabels({ userId: user.$id, labels: [role] });
-      row.approval_status = 'approved';
-      row.approved_by = 'bootstrap';
-      row.approved_at = new Date().toISOString();
-    }
-    await new TablesDB(client).upsertRows({ databaseId: 'opd', tableId: 'app_users', rows: [row] });
-    log(`user ${user.$id} → ${row.approval_status}${role ? ` (${role})` : ''}`);
-    return res.json({ ok: true, deleted: false, status: row.approval_status });
   } catch (e) {
     error(String(e?.stack || e));
     return res.json({ ok: false, error: String(e?.message || e) }, 500);
